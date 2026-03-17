@@ -812,20 +812,7 @@ async function handleFiles(files) {
     return;
   }
 
-  // Process images
-  let imgCount = 0;
-  if (imgFiles.length > 0) {
-    const imageRecords = [];
-    for (const file of imgFiles) {
-      const dataURL = await fileToDataURL(file);
-      imageMap[file.name] = dataURL;
-      imageRecords.push({ name: file.name, dataURL });
-      imgCount++;
-    }
-    await saveImages(imageRecords);
-  }
-
-  // Process recipes
+  // Process recipes first so we know which cover images are needed
   let imported = 0;
   for (const file of mdFiles) {
     const text = await file.text();
@@ -838,12 +825,29 @@ async function handleFiles(files) {
     }
   }
 
-  if (imported > 0) {
-    await saveRecipes(recipes);
+  // Build set of all cover image filenames referenced by recipes
+  const neededImages = new Set();
+  for (const r of recipes) {
+    if (r.cover) neededImages.add(r.cover);
+  }
+
+  // Process images — only keep ones that match a recipe's cover field
+  let imgCount = 0;
+  if (imgFiles.length > 0) {
+    const imageRecords = [];
+    for (const file of imgFiles) {
+      if (!neededImages.has(file.name)) continue; // skip unrelated images
+      const dataURL = await fileToDataURL(file);
+      imageMap[file.name] = dataURL;
+      imageRecords.push({ name: file.name, dataURL });
+      imgCount++;
+    }
+    if (imageRecords.length > 0) await saveImages(imageRecords);
+  }
+
+  if (imported > 0 || imgCount > 0) {
+    if (imported > 0) await saveRecipes(recipes);
     buildFilters();
-    renderGrid();
-  } else if (imgCount > 0) {
-    // Re-render to pick up newly imported images
     renderGrid();
   }
 
