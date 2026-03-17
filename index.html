@@ -555,7 +555,7 @@ body {
 <div class="global-drop-overlay" id="globalDrop">
   <div class="global-drop-message">
     <div class="global-drop-message-icon">+</div>
-    <div class="global-drop-message-text">Drop recipe files to import</div>
+    <div class="global-drop-message-text">Drop recipe files or images to import</div>
   </div>
 </div>
 
@@ -594,9 +594,9 @@ body {
     <h2>Your recipes, beautifully browsed</h2>
     <p>Drop your Obsidian recipe markdown files here to get started. The app reads YAML frontmatter for filtering and renders the full recipe.</p>
     <div class="drop-zone" id="dropZone">
-      <div class="drop-zone-label">Drop .md files or a folder here</div>
+      <div class="drop-zone-label">Drop .md files, images, or a folder here</div>
       <div class="drop-zone-hint">or tap to browse</div>
-      <input type="file" id="fileInput" accept=".md" multiple webkitdirectory>
+      <input type="file" id="fileInput" accept=".md,.jpg,.jpeg,.png,.webp,.gif" multiple webkitdirectory>
     </div>
   </div>
 
@@ -620,7 +620,7 @@ body {
 <div class="toast-container" id="toastContainer"></div>
 
 <!-- Hidden file input for re-import -->
-<input type="file" id="hiddenFileInput" accept=".md" multiple webkitdirectory style="display:none">
+<input type="file" id="hiddenFileInput" accept=".md,.jpg,.jpeg,.png,.webp,.gif" multiple webkitdirectory style="display:none">
 
 <script>
 // ===== STATE =====
@@ -693,8 +693,9 @@ function cleanMarkdownBody(md) {
 
 // ===== INDEXEDDB PERSISTENCE =====
 const DB_NAME = 'MiseEnPlace';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'recipes';
+const IMAGE_STORE = 'images';
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -703,6 +704,9 @@ function openDB() {
       const db = e.target.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(IMAGE_STORE)) {
+        db.createObjectStore(IMAGE_STORE, { keyPath: 'name' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -734,34 +738,99 @@ async function loadRecipes() {
 
 async function clearRecipes() {
   const db = await openDB();
-  const tx = db.transaction(STORE_NAME, 'readwrite');
+  const tx = db.transaction([STORE_NAME, IMAGE_STORE], 'readwrite');
   tx.objectStore(STORE_NAME).clear();
+  tx.objectStore(IMAGE_STORE).clear();
   return new Promise((resolve, reject) => {
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
   });
 }
 
+// ===== IMAGE STORAGE =====
+async function saveImages(imageList) {
+  const db = await openDB();
+  const tx = db.transaction(IMAGE_STORE, 'readwrite');
+  const store = tx.objectStore(IMAGE_STORE);
+  for (const img of imageList) store.put(img);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadImages() {
+  const db = await openDB();
+  const tx = db.transaction(IMAGE_STORE, 'readonly');
+  const store = tx.objectStore(IMAGE_STORE);
+  const req = store.getAll();
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Map of image filename → data URL (populated on init and import)
+let imageMap = {};
+
+function fileToDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function getImageForRecipe(recipe) {
+  if (!recipe.cover) return null;
+  // cover field is already cleaned of wikilinks, e.g. "Chocolate Chip Banana Bread.jpg"
+  return imageMap[recipe.cover] || null;
+}
+
 // ===== FILE IMPORT =====
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif'];
+
+function isImageFile(filename) {
+  const lower = filename.toLowerCase();
+  return IMAGE_EXTENSIONS.some(ext => lower.endsWith(ext));
+}
+
 async function handleFiles(files) {
   const mdFiles = [];
+  const imgFiles = [];
   for (const file of files) {
     if (file.name.endsWith('.md')) {
       mdFiles.push(file);
+    } else if (isImageFile(file.name)) {
+      imgFiles.push(file);
     }
   }
 
-  if (mdFiles.length === 0) {
-    showToast('No .md files found');
+  if (mdFiles.length === 0 && imgFiles.length === 0) {
+    showToast('No .md or image files found');
     return;
   }
 
+  // Process images
+  let imgCount = 0;
+  if (imgFiles.length > 0) {
+    const imageRecords = [];
+    for (const file of imgFiles) {
+      const dataURL = await fileToDataURL(file);
+      imageMap[file.name] = dataURL;
+      imageRecords.push({ name: file.name, dataURL });
+      imgCount++;
+    }
+    await saveImages(imageRecords);
+  }
+
+  // Process recipes
   let imported = 0;
   for (const file of mdFiles) {
     const text = await file.text();
     const recipe = parseRecipeFile(file.name, text);
     if (recipe) {
-      // Check for duplicate by id, replace if exists
       const idx = recipes.findIndex(r => r.id === recipe.id);
       if (idx >= 0) recipes[idx] = recipe;
       else recipes.push(recipe);
@@ -773,7 +842,17 @@ async function handleFiles(files) {
     await saveRecipes(recipes);
     buildFilters();
     renderGrid();
-    showToast(`Imported ${imported} recipe${imported > 1 ? 's' : ''}`);
+  } else if (imgCount > 0) {
+    // Re-render to pick up newly imported images
+    renderGrid();
+  }
+
+  // Toast
+  const parts = [];
+  if (imported > 0) parts.push(`${imported} recipe${imported > 1 ? 's' : ''}`);
+  if (imgCount > 0) parts.push(`${imgCount} image${imgCount > 1 ? 's' : ''}`);
+  if (parts.length > 0) {
+    showToast(`Imported ${parts.join(' and ')}`);
   } else {
     showToast('No recipe files found (need type: recipe in frontmatter)');
   }
@@ -954,9 +1033,10 @@ function renderGrid() {
     const timeStr = r.total_time || r.active_time || '';
     const ratingStr = r.rating ? '★'.repeat(Math.min(r.rating, 5)) : '';
 
+    const coverImg = getImageForRecipe(r);
     card.innerHTML = `
       <div class="card-image">
-        <div class="card-image-placeholder">${cuisineEmoji}</div>
+        ${coverImg ? `<img src="${coverImg}" alt="${escHtml(r.title)}" loading="lazy">` : `<div class="card-image-placeholder">${cuisineEmoji}</div>`}
         ${r.difficulty ? `<div class="card-difficulty">${r.difficulty}</div>` : ''}
       </div>
       <div class="card-body">
@@ -1030,7 +1110,11 @@ function openDetail(recipe) {
   const cleanBody = cleanMarkdownBody(recipe.body);
   const bodyHtml = marked.parse(cleanBody);
 
+  const detailImg = getImageForRecipe(recipe);
+  const detailImgHtml = detailImg ? `<img src="${detailImg}" alt="${escHtml(recipe.title)}" style="width:100%;border-radius:var(--radius);margin-bottom:20px;max-height:400px;object-fit:cover;">` : '';
+
   content.innerHTML = `
+    ${detailImgHtml}
     <h1 class="detail-title">${escHtml(recipe.title)}</h1>
     ${tagsHtml}
     ${descHtml}
@@ -1145,6 +1229,16 @@ function escHtml(str) {
 
 // ===== INIT =====
 async function init() {
+  // Load persisted images
+  try {
+    const storedImages = await loadImages();
+    for (const img of storedImages) {
+      imageMap[img.name] = img.dataURL;
+    }
+  } catch(e) {
+    console.warn('Failed to load images from IndexedDB:', e);
+  }
+
   // Load persisted recipes
   try {
     recipes = await loadRecipes();
